@@ -1,0 +1,104 @@
+import os
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader, ConcatDataset
+import json
+from datetime import datetime
+from tqdm import tqdm
+
+# 注意：这里导入的是我们刚写的 _im 改进版模型
+from models.pln_model_inc_im import build_model 
+from dataloader.voc import PLNDataset
+from losses.pln_loss import plnLoss
+
+class Config:
+    img_size = 448
+    S = 14
+    num_classes = 20
+    
+    # --- 训练接力配置 ---
+    # 填入你之前跑出的 60% mAP 的模型路径
+    resume_path = './checkpointincep/best_model.pth' 
+    output_dir = './checkpoint_refined' # 新的保存路径
+    log_dir = './logs_refined'
+    
+    num_epochs = 30    # 既然是微调，不需要再跑 100 轮
+    batch_size = 16    # 根据显存调整，建议 16 或 8
+    learning_rate = 2e-5  # 大幅降低学习率 (微调模式)
+    weight_decay = 1e-4
+    
+    save_interval = 5
+    w_coord = 2.0
+    w_class = 1.0
+    w_link = 1.0
+    noob_scale = 0.5
+
+    train_datasets = {
+        'train2007': './datasets/VOC/images/train2007',
+        'train2012': './datasets/VOC/images/train2012',
+    }
+    label_dir_template = './datasets/VOC/labels/{}'
+
+def train():
+    config = Config()
+    os.makedirs(config.output_dir, exist_ok=True)
+    os.makedirs(config.log_dir, exist_ok=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 1. 加载改进版模型
+    # backbone_pretrained 设为 False，因为我们要加载自己的 resume_path
+    model = build_model(backbone_pretrained=False).to(device)
+    
+    if os.path.exists(config.resume_path):
+        print(f"==> 加载预训练权重进行接力训练: {config.resume_path}")
+        # 使用 strict=True，因为你的修改没有增删参数名，只是内部逻辑变了，所以权重能完美对上
+        model.load_state_dict(torch.load(config.resume_path, map_location=device))
+    else:
+        print("Warning: 未找到预训练权重，将从头开始训练！")
+
+    # 2. 数据准备 (略，与原版一致)
+    datasets = []
+    for split, img_dir in config.train_datasets.items():
+        datasets.append(PLNDataset(img_dir, config.label_dir_template.format(split)))
+    train_loader = DataLoader(ConcatDataset(datasets), batch_size=config.batch_size, shuffle=True, num_workers=4)
+
+    # 3. 损失与优化器
+    criterion = plnLoss(config.S, 2, config.w_class, config.w_coord, config.w_link, config.noob_scale)
+    optimizer = optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    
+    best_loss = float('inf')
+
+    # 4. 训练循环
+    for epoch in range(config.num_epochs):
+        model.train()
+        running_loss = 0.0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
+        
+        for images, targets in pbar:
+            images, targets = images.to(device), targets.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(images)
+            
+            # 这里的 outputs['branch_features'] 已经是平均过的了
+            total_loss = 0
+            for name in model.branch_names:
+                loss, _ = criterion(outputs['branch_features'][name], targets)
+                total_loss += loss
+            
+            total_loss.backward()
+            optimizer.step()
+            
+            running_loss += total_loss.item()
+            pbar.set_postfix({'loss': total_loss.item()})
+
+        avg_loss = running_loss / len(train_loader)
+        print(f"Epoch {epoch+1} Avg Loss: {avg_loss:.4f}")
+
+        # 保存逻辑
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), os.path.join(config.output_dir, 'best_model_refined.pth'))
+
+if __name__ == '__main__':
+    train()
